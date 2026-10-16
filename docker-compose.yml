@@ -21,6 +21,19 @@ services:
     volumes:
       - app_data:/data
 
+  # The Discord bot: same image, no port, no volume, and no model of its own.
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      app:
+        condition: service_healthy
+    command: ["python", "-m", "mcclub_rag.discordbot"]
+    # The image's healthcheck curls :8000, which the bot does not serve
+    healthcheck:
+      disable: true
+
 volumes:
   qdrant_storage:
   app_data:

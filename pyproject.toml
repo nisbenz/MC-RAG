@@ -21,6 +21,7 @@ dependencies = [
     "charset-normalizer~=3.5",
     "lxml~=6.1",
     "pillow~=12.3",  # deskew of photographed pages before OCR (ingest/deskew.py)
+    "discord-py~=2.7",
 ]
 
 [dependency-groups]
@@ -30,6 +31,7 @@ dev = [
     "pytest~=9.1",
     "pytest-asyncio~=1.4",
     "python-docx~=1.2",
+    "pyyaml~=6.0",
     "ruff~=0.16",
 ]
 
