@@ -389,6 +389,10 @@ async def sync_commands(
     while discord.py's `sync(guild=...)` sends only the commands registered for that guild. Without
     the copy the PUT carries an empty list, Discord answers 200, and the guild sees no commands at
     all (observed on 2026-10-16; EDGE_CASES.md).
+
+    With guilds configured the global list is emptied too: Discord keeps whatever an earlier run
+    registered globally, and a guild shows its own commands *and* the global ones, so a bot that
+    once ran without `DISCORD_GUILDS` listed every command twice (12 for 6, 2026-10-16).
     """
     if getattr(client, "_commands_synced", False):
         return
@@ -397,6 +401,8 @@ async def sync_commands(
             guild = discord.Object(id=guild_id)
             tree.copy_global_to(guild=guild)
             await tree.sync(guild=guild)
+        tree.clear_commands(guild=None)
+        await tree.sync()
     else:
         await tree.sync()
     client._commands_synced = True  # noqa: SLF001 - a one-shot guard for on_ready reconnects

@@ -105,6 +105,10 @@ def _wire(client: object, monkeypatch: pytest.MonkeyPatch, method: str, fake) ->
     monkeypatch.setattr(client.http, method, fake)
 
 
+async def _no_global_upsert(application_id: int, payload: list[dict]) -> list:
+    return []
+
+
 async def test_a_configured_guild_receives_the_commands_in_the_synced_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -125,12 +129,39 @@ async def test_a_configured_guild_receives_the_commands_in_the_synced_payload(
     settings = _settings()
     client = build_client(settings)
     _wire(client, monkeypatch, "bulk_upsert_guild_commands", fake_guild_upsert)
+    _wire(client, monkeypatch, "bulk_upsert_global_commands", _no_global_upsert)
 
     await sync_commands(client, client.tree, settings)
     await client.rag_client.aclose()
 
     assert sent["guild_id"] == 42
     assert sorted(sent["names"]) == sorted(EXPECTED_COMMANDS)
+
+
+async def test_guild_mode_empties_the_global_list_so_commands_are_not_listed_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An earlier global registration plus the guild one showed every command twice (12 for 6)."""
+    sent: dict[str, object] = {}
+
+    async def fake_guild_upsert(application_id: int, guild_id: int, payload: list[dict]) -> list:
+        sent["guild_names"] = [command["name"] for command in payload]
+        return []
+
+    async def fake_global_upsert(application_id: int, payload: list[dict]) -> list:
+        sent["global"] = payload
+        return []
+
+    settings = _settings()
+    client = build_client(settings)
+    _wire(client, monkeypatch, "bulk_upsert_guild_commands", fake_guild_upsert)
+    _wire(client, monkeypatch, "bulk_upsert_global_commands", fake_global_upsert)
+
+    await sync_commands(client, client.tree, settings)
+    await client.rag_client.aclose()
+
+    assert sorted(sent["guild_names"]) == sorted(EXPECTED_COMMANDS)
+    assert sent["global"] == []
 
 
 async def test_without_a_guild_the_same_commands_are_registered_globally(
@@ -166,6 +197,7 @@ async def test_every_configured_guild_is_registered_separately(
     settings = _settings(guilds="42:7:8,99:6:9")
     client = build_client(settings)
     _wire(client, monkeypatch, "bulk_upsert_guild_commands", fake_guild_upsert)
+    _wire(client, monkeypatch, "bulk_upsert_global_commands", _no_global_upsert)
 
     await sync_commands(client, client.tree, settings)
     await client.rag_client.aclose()
@@ -187,6 +219,7 @@ async def test_a_reconnect_does_not_re_register_the_commands(
     settings = _settings()
     client = build_client(settings)
     _wire(client, monkeypatch, "bulk_upsert_guild_commands", fake_guild_upsert)
+    _wire(client, monkeypatch, "bulk_upsert_global_commands", _no_global_upsert)
 
     await sync_commands(client, client.tree, settings)
     await sync_commands(client, client.tree, settings)
