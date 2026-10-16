@@ -1,5 +1,81 @@
 # progress
 
+## 2026-10-16 (discord bot: first run against real Discord)
+
+### Shipped
+
+- The bot is live in a real guild. `DISCORD_BOT_TOKEN` is set in the (gitignored) `.env` and
+  `DISCORD_GUILD_ID=1560639789043032176` ("mcbot expe", the account's only guild) was read from
+  `GET /users/@me/guilds` rather than copied by hand. The gateway boundary that the design could only
+  read from the 2.7 API is now observed: shard connected, `bot_ready` as `mcnigga#2436`.
+- `/ask`, `/reset`, `/status` are registered as guild commands, verified by re-reading
+  `GET /applications/<id>/guilds/<id>/commands` — 3 commands, `public` and `question` options intact.
+  `DISCORD_MEMBER_ROLE_ID` stays blank on purpose: the guild has only `@everyone` and the bot's own
+  role, so there is no club role to bind; every question is public until one exists (design 3.2).
+- Two defects that only a real run could find, both fixed with tests that fail without the fix:
+  - **A blank `DISCORD_*` line crashed the bot before the gateway.** `.env.example` ships
+    `DISCORD_GUILD_ID=` and `DISCORD_MEMBER_ROLE_ID=` empty to mean "global" and "public", but an
+    empty variable is present, not absent, for pydantic-settings — `ValidationError`, twice. The
+    offline suite passed because every test unset the variables instead of blanking them. Fixed with
+    `_blank_means_unset`; 15 cases added, including one that boots the shipped `.env.example`.
+  - **Guild command sync registered nothing, silently.** `@tree.command` fills the tree's *global*
+    mapping while `sync(guild=...)` sends only that guild's commands, so the PUT carried `[]`: HTTP
+    200, no exception, `bot_ready` logged, zero commands in the guild. Fixed with `copy_global_to`;
+    verified by deleting every command, restarting from empty and re-reading the API.
+- 18 tests added (15 settings, 3 wiring); fast job 1232 passed, ruff and `uv lock --check` green.
+
+### Blocked
+
+- The API half has nothing to talk to locally: the Docker daemon is down and `models/` is empty, so
+  the app container cannot start (no Qdrant, no embedder, no reranker). `/ask` and `/status` will
+  answer with the unreachable notice until the stack is up. The same reason leaves
+  `DISCORD_MEMBER_ROLE_ID` unset.
+- No interaction has been invoked by a human yet, so `defer` + `edit_original_response`, ephemeral
+  follow-ups and button dispatch are still read, not seen. A single `/status` in the guild closes
+  that: it needs no API, only the bot.
+
+### Next
+
+- Start the stack (Docker, then `scripts/download_models.py` for tessdata/bge-m3/BM25/mmarco) and
+  ask a real question in `mcbot expe`.
+- Create the club role, then set `DISCORD_MEMBER_ROLE_ID` and re-check the member/public split.
+- Consider dropping the bot's Administrator permission (the invite granted all bits); it needs only
+  Send Messages and Embed Links.
+
+
+## 2026-10-16 (discord bot: spec trio, then the implementation)
+
+### Shipped
+
+- `specs/discord-bot/{requirements,design,tasks}.md`, a third spec area, on branch `discord-exp`
+  (10 requirements, 41 EARS criteria). Four criteria were rewritten because the code disagreed with
+  them: the bot cannot choose `conversation_id` (`conversation.py::create` mints `c_<uuid4>` for any
+  unknown id, so a fixed channel id would reset the conversation every turn), a 429 carries no
+  `Retry-After` and no remaining-seconds field, `/health` exposes no LLM headroom for `/status`, and
+  "changes nothing inside `src/mcclub_rag/`" became "adds no change to any existing module".
+- `src/mcclub_rag/discordbot/`, a thin client over the frozen API: `/ask` (with `public`), `/reset`,
+  `/status`; slash-only on default intents, so no privileged intent and no Discord verification.
+  `commands.py` and `render.py` return a `RenderedReply` of plain dataclasses and only `app.py` and
+  `views.py` import discord.py, so every member-visible behaviour is tested without a gateway.
+- `discord.py~=2.7` (2.7.1, MIT) in `dependencies`; a third Compose service (`bot`) reusing the app
+  image with no port, no volume, `healthcheck: disable: true` and `depends_on: app:
+  service_healthy`; the seven `DISCORD_*` variables documented in `.env.example` behind a test that
+  fails if a field is ever undocumented.
+- 129 tests added, none with a marker: `tests/bot_fakes.py` plus nine `tests/test_bot_*.py`, all
+  offline (a recording fake client and `httpx.MockTransport`).
+
+### Blocked
+
+- `DISCORD_BOT_TOKEN` is still empty in `.env`, so nothing has run against a real guild. The
+  Discord-side assumptions (ephemeral defer plus `edit_original_response`, ephemeral follow-ups,
+  component dispatch) are read from the 2.7 API, not observed.
+
+### Next
+
+- A spike against a test guild to confirm those behaviours, then `DISCORD_GUILD_ID` and
+  `DISCORD_MEMBER_ROLE_ID`, and the operator run in a real channel.
+
+
 ## 2026-10-15 (readme rewrite, docs sweep)
 
 ### Shipped

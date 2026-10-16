@@ -152,6 +152,7 @@ uv run python -m eval.e2e.compare <a.json> <b.json>   # metric deltas, regressio
 uv run python scripts/build_eval_corpus.py   # rebuild data/parsed from eval/corpus_sources.txt
 uv run python scripts/ingest_folder.py <dir> --visibility public   # needs Qdrant
 uv run python scripts/reindex.py   # rebuild after embedder/chunking changes
+uv run python -m mcclub_rag.discordbot   # the bot; needs DISCORD_BOT_TOKEN
 cp .env.example .env && docker compose up -d --build
 ```
 
@@ -317,6 +318,33 @@ synthetic `eval/e2e/corpus/`), scored by rules, run by `python -m eval.e2e.run`.
   `message` longer than 2000 chars returns 422.
 - Errors are always JSON: `{"error": {"code": "...", "message": "..."}}`.
 
+## Discord bot (implemented, `specs/discord-bot/`)
+
+`src/mcclub_rag/discordbot/`, run as `python -m mcclub_rag.discordbot` (its own Compose service, same
+image, no port). A thin client over the frozen API — it adds no route and changes no existing module.
+Rules that bite:
+
+- **The API mints the `conversation_id`; the bot only echoes it.** `conversation.py::create` returns
+  `c_<uuid4>` and `api/chat.py` calls it whenever `load()` misses, so a bot-chosen id would reset the
+  conversation on every turn. The bot omits `conversation_id` on a channel's first question and sends
+  back what the reply carried (`discordbot/state.py`).
+- **Slash commands only, default intents**: no `message_content`, no `on_message`, so no privileged
+  intent and no Discord verification.
+- **`precheck` runs before `defer()`**: an over-long question, a caller inside cooldown or a guild at
+  its cap is refused without an interaction or an API call. `defer(ephemeral=not public)` is
+  mandatory — the chat route's p95 is above Discord's 3-second window.
+- **The whole server is one client IP to the API**: `api/chat.py` keys the limiter on
+  `request.client.host`, so the bot's own per-user cooldown and per-guild cap are the real guard, and a
+  429 is reported, never retried.
+- **A private answer is never published.** If the interaction expires, a `public: true` answer goes to
+  the channel and an ephemeral one becomes a short notice, with the answer dropped.
+- **Feedback buttons do not survive a bot restart** (discord.py re-dispatches only to a view registered
+  under the exact `custom_id`, and ours carries the conversation id). Stated in `views.py`.
+- **`discord.py~=2.7`** (MIT, pure Python) is the bot's only new dependency, declared in `dependencies` so one `uv.lock` covers both containers.
+- **`commands.py` and `render.py` are pure**, returning a `RenderedReply` of plain dataclasses; only
+  `app.py` and `views.py` import discord.py. No marker, no model file, no network
+  (`tests/bot_fakes.py`, `httpx.MockTransport`).
+
 ## Layout
 
 ```
@@ -328,12 +356,15 @@ src/mcclub_rag/
 ├── text/       normalize.py, lang.py
 ├── retrieval/  registry.py, embed.py, store.py, settings.py, query.py, search.py, rerank.py,
 │               gate.py, backend.py
-└── llm/        client.py, quota.py, prompts.py, rewrite.py
+├── llm/        client.py, quota.py, prompts.py, rewrite.py
+└── discordbot/ settings.py, client.py, commands.py, render.py, notices.py, state.py,
+                views.py, app.py, __main__.py
 scripts/        download_models.py, ingest_folder.py, reindex.py
 eval/           README.md, questions.jsonl, corpus.json, metrics.py, run_eval.py, bench_models.py,
                 bench_report.py, bench_rerank.py, results/
 eval/e2e/       cases*.jsonl, corpus/, cases.py, score.py, insights.py, drivers.py, suites.py, run.py, …
-tests/          conftest.py, test_api_contract.py, test_access.py, test_ingest.py, test_gate.py
+tests/          conftest.py, test_api_contract.py, test_access.py, test_ingest.py, test_gate.py,
+                bot_fakes.py, test_bot_*.py
 ```
 
 Built: preprocessing (below) and chunking (`ingest/chunk.py`, `ingest/tokens.py`,
@@ -344,13 +375,14 @@ Built: preprocessing (below) and chunking (`ingest/chunk.py`, `ingest/tokens.py`
 above). eequaled built `api/`, `llm/`, `answer.py`, `conversation.py`,
 `config.py`, `main.py`, `schemas.py` and the rest of the top level (`rate_limit.py` too).
 Retrieval is built too (`retrieval/{settings,query,search,rerank,gate,backend}.py`, `eval/`; see
-"Retrieval" above). The backends are wired in `main.py` (`default_state`).
+"Retrieval" above). The backends are wired in `main.py` (`default_state`). The Discord bot is built too
+(`src/mcclub_rag/discordbot/`, composing as a third service; see "Discord bot" above).
 
 ## Configuration
 
 Env vars via pydantic-settings; see [.env.example](.env.example) (model ids, Qdrant URL/collection,
 token/keys, LLM limits/timeout, retrieval top-k/top-n, `GATE_THRESHOLD` unset with bge (0.31 for gte; relevance floor, `eval.calibrate_gate`),
-`LOG_LEVEL`, plus `INGEST_*`). Document each new variable with a comment line
+`LOG_LEVEL`, plus `INGEST_*` and the bot's `DISCORD_*`). Document each new variable with a comment line
 in `.env.example`. Never commit `.env` or real keys.
 
 ## Repo docs

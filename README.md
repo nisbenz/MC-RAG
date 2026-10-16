@@ -259,6 +259,24 @@ between two runs.
 
 ---
 
+## Discord bot
+
+`src/mcclub_rag/discordbot/` is a thin client over the API above, run as its own Compose service (same
+image, no published port, no volume, no model of its own).
+
+- `/ask question:` posts a question. The answer is private unless the asker passes `public: true`, which
+  posts it in the channel with an attribution line; either way it carries the sources, the grounding
+  state and the token usage, with thumbs-up / thumbs-down buttons wired to `POST /api/v1/feedback`.
+- `/reset` starts a new conversation in the channel; `/status` reports API health and the bot's limits.
+- Slash commands only, on default intents, so no privileged intent and no Discord verification.
+- A configured guild and member role grant members-level access; with either unset every question is
+  public. A per-user cooldown and a per-guild concurrency cap keep one member from spending the day's
+  LLM budget.
+- Covered by tests that need neither Discord nor the API: [specs/discord-bot/](specs/discord-bot/),
+  [AGENTS.md](AGENTS.md).
+
+---
+
 ## Configuration
 
 Every variable is documented in [.env.example](.env.example). The ones that matter:
@@ -345,7 +363,7 @@ tests/          one module per source module, plus contract, access and wiring t
 |---|---|
 | [eval/README.md](eval/README.md) | The evaluation guide: sets, metrics, suites, latest results |
 | [eval/results/README.md](eval/results/README.md) | Every measurement, with the run that produced it |
-| [EDGE_CASES.md](EDGE_CASES.md) | 68 non-obvious edge cases, each with proof and a decision |
+| [EDGE_CASES.md](EDGE_CASES.md) | 72 non-obvious edge cases, each with proof and a decision |
 | [PROGRESS.md](PROGRESS.md) | Dated log: what shipped, what is blocked, what is next |
 | [AGENTS.md](AGENTS.md) | Fixed decisions and the rules for contributors and coding agents |
 | [journals/](journals/) | One `project_journal.md` per team member |
