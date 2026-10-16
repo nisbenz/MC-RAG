@@ -2,17 +2,37 @@
 
 import pytest
 
-from mcclub_rag.discordbot.client import ApiFailure, ChatOutcome, HealthOutcome
+from mcclub_rag.discordbot.client import (
+    AdminOutcome,
+    ApiFailure,
+    ChatOutcome,
+    DocumentsOutcome,
+    HealthOutcome,
+)
 from mcclub_rag.discordbot.commands import (
     MAX_QUESTION_CHARS,
     AskRequest,
+    IngestRequest,
+    forget_confirmation,
+    ingest_precheck,
     precheck,
     run_ask,
+    run_documents,
+    run_forget,
+    run_ingest,
     run_reset,
     run_status,
 )
 from mcclub_rag.discordbot.notices import (
+    ADMIN_REFUSED,
     BUSY,
+    DELETE_CONFIRM,
+    DELETE_DONE,
+    DELETE_NOT_FOUND,
+    INGEST_DONE,
+    INGEST_FAILED,
+    NO_DOCUMENTS,
+    ONE_SOURCE,
     RATE_LIMITED,
     RESET_DONE,
     SERVICE_UNAVAILABLE,
@@ -27,6 +47,14 @@ from mcclub_rag.discordbot.state import ConversationDirectory, GuildSlots, UserC
 from tests.bot_fakes import FakeRagClient, chat_response
 
 ARABIC_QUESTION = "كم رسوم العضوية في النادي هذا العام؟"
+
+# The admin failure mapping of `commands._ADMIN_FAILURE_TABLES`, restated so a change to either
+# side is visible rather than silently agreeing with itself.
+ADMIN_FAILURE_TABLES_EXPECTED: dict[str, dict[str, str]] = {
+    "unauthorized": ADMIN_REFUSED,
+    "forbidden": ADMIN_REFUSED,
+    "rate_limited": RATE_LIMITED,
+}
 
 
 def _request(question: str = "Where is the club?", **overrides: object) -> AskRequest:
@@ -222,4 +250,171 @@ async def test_status_reports_health_and_the_bots_own_guards() -> None:
 async def test_status_reports_an_unreachable_api() -> None:
     client = FakeRagClient(health=HealthOutcome(failure=ApiFailure("unreachable")))
     reply = await run_status(client=client, settings=_settings())
+    assert _text(reply) == notice(SERVICE_UNAVAILABLE, "en")
+
+
+# --- The admin commands (requirements 11 to 14) ----------------------------------------------
+
+
+def _rendered(reply) -> str:  # noqa: ANN001 - a tiny test helper
+    """Every string a reply carries, embed description included: `/documents` sends no content."""
+    pieces = [part.content or "" for part in reply.parts]
+    pieces += [part.embed.description if part.embed else "" for part in reply.parts]
+    return "\n".join(pieces)
+
+
+def _ingest(**overrides: object) -> IngestRequest:
+    values: dict[str, object] = {
+        "filename": "rules.pdf",
+        "data": b"%PDF-1.7 bytes",
+        "url": None,
+        "visibility": "public",
+        "topic": None,
+        "user_id": 7,
+        "guild_id": 42,
+        "channel_id": 99,
+    }
+    values.update(overrides)
+    return IngestRequest(**values)  # type: ignore[arg-type]
+
+
+def test_ingest_precheck_refuses_both_sources_and_neither() -> None:
+    """Req 13.1: the ambiguity is settled here, not by whichever source the API would pick."""
+    both = _ingest(url="https://example.org/rules")
+    assert _text(ingest_precheck(both, language="en")) == notice(ONE_SOURCE, "en")
+    neither = _ingest(filename=None, data=None)
+    assert _text(ingest_precheck(neither, language="en")) == notice(ONE_SOURCE, "en")
+
+
+def test_ingest_precheck_accepts_either_source() -> None:
+    assert ingest_precheck(_ingest(), language="en") is None
+    assert (
+        ingest_precheck(_ingest(filename=None, data=None, url="https://x.org"), language="en")
+        is None
+    )
+
+
+async def test_a_file_ingest_sends_the_bytes_the_visibility_and_the_topic() -> None:
+    client = FakeRagClient()
+    outcome = await run_ingest(_ingest(visibility="members", topic="rules"), client=client)
+    assert client.ingests == [
+        {
+            "kind": "file",
+            "filename": "rules.pdf",
+            "data": b"%PDF-1.7 bytes",
+            "visibility": "members",
+            "topic": "rules",
+        }
+    ]
+    assert outcome.failure is None
+    assert outcome.doc_id == "doc-new"
+    assert len(client.ingests) == 1  # never retried (Req 13.5)
+
+
+async def test_a_url_ingest_never_reads_an_attachment() -> None:
+    """Req 15.1: the API fetches the page, because the SSRF guard lives there."""
+    client = FakeRagClient()
+    await run_ingest(_ingest(filename=None, data=None, url="https://x.org/rules"), client=client)
+    assert client.ingests[0]["kind"] == "url"
+    assert client.ingests[0]["url"] == "https://x.org/rules"
+
+
+async def test_a_finished_ingest_names_the_doc_id_and_the_visibility() -> None:
+    client = FakeRagClient()
+    outcome = await run_ingest(_ingest(visibility="members"), client=client)
+    assert _text(outcome.reply) == notice(
+        INGEST_DONE, "en", name="rules.pdf", visibility="members", doc_id="doc-new"
+    )
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "file_too_large",
+        "unsupported_file_type",
+        "parse_error",
+        "empty_document",
+        "url_not_allowed",
+        "fetch_error",
+        "index_unavailable",
+    ],
+)
+async def test_a_refused_ingest_is_reported_as_its_own_code(code: str) -> None:
+    """Req 13.5: the API's code is shown, and the failure is never rendered as success."""
+    client = FakeRagClient(admin=AdminOutcome(failure=ApiFailure(code, 422)))
+    outcome = await run_ingest(_ingest(), client=client)
+    assert outcome.failure is not None and outcome.failure.code == code
+    assert outcome.doc_id is None
+    assert _text(outcome.reply) == notice(INGEST_FAILED, "en", name="rules.pdf", reason=code)
+    assert len(client.ingests) == 1
+
+
+async def test_a_refused_admin_key_says_so_and_is_not_blamed_on_the_document() -> None:
+    """Req 11.4: a bad `ADMIN_API_KEY` is an operator problem, not a bad file."""
+    client = FakeRagClient(admin=AdminOutcome(failure=ApiFailure("unauthorized", 401)))
+    outcome = await run_ingest(_ingest(), client=client)
+    assert _text(outcome.reply) == notice(ADMIN_REFUSED, "en")
+
+
+async def test_an_arabic_ingest_failure_is_arabic() -> None:
+    client = FakeRagClient(admin=AdminOutcome(failure=ApiFailure("parse_error", 422)))
+    outcome = await run_ingest(_ingest(), client=client, language="ar")
+    assert _text(outcome.reply) == notice(
+        INGEST_FAILED, "ar", name="rules.pdf", reason="parse_error"
+    )
+
+
+async def test_documents_lists_what_the_api_returned() -> None:
+    """Req 12.1: the listing carries the handle `/forget` needs, so the id is in it."""
+    client = FakeRagClient()
+    reply = await run_documents(client=client)
+    assert client.list_calls == 1
+    listing = _rendered(reply)
+    assert "Club rules" in listing
+    assert "doc-1" in listing
+    assert "public" in listing
+
+
+async def test_an_empty_corpus_is_a_notice_not_an_empty_embed() -> None:
+    """Req 12.2."""
+    client = FakeRagClient(documents=DocumentsOutcome(documents=[]))
+    reply = await run_documents(client=client)
+    assert _text(reply) == notice(NO_DOCUMENTS, "en")
+    assert reply.parts[0].embed is None
+
+
+@pytest.mark.parametrize("code", ["unauthorized", "forbidden", "rate_limited"])
+async def test_a_refused_listing_is_one_notice(code: str) -> None:
+    client = FakeRagClient(documents=DocumentsOutcome(failure=ApiFailure(code, 429)))
+    reply = await run_documents(client=client)
+    assert _text(reply) == notice(ADMIN_FAILURE_TABLES_EXPECTED[code], "en")
+
+
+def test_forget_confirmation_names_the_document_it_would_delete() -> None:
+    reply = forget_confirmation(doc_id="doc-1", title="Club rules")
+    assert _text(reply) == notice(DELETE_CONFIRM, "en", name="Club rules", doc_id="doc-1")
+
+
+def test_forget_confirmation_falls_back_to_the_id() -> None:
+    reply = forget_confirmation(doc_id="doc-1")
+    assert "doc-1" in _text(reply)
+
+
+async def test_a_deleted_document_is_reported_with_its_id() -> None:
+    client = FakeRagClient(admin=AdminOutcome(deleted=True))
+    reply = await run_forget(client=client, doc_id="doc-1")
+    assert client.deletes == ["doc-1"]
+    assert _text(reply) == notice(DELETE_DONE, "en", doc_id="doc-1")
+
+
+async def test_an_unknown_id_is_not_reported_as_a_delete() -> None:
+    """Req 14.3: `{"ok": false}` is a miss."""
+    client = FakeRagClient(admin=AdminOutcome(deleted=False))
+    reply = await run_forget(client=client, doc_id="ghost")
+    assert _text(reply) == notice(DELETE_NOT_FOUND, "en", doc_id="ghost")
+
+
+async def test_a_failed_delete_is_not_reported_as_a_delete() -> None:
+    client = FakeRagClient(admin=AdminOutcome(failure=ApiFailure("unreachable")))
+    reply = await run_forget(client=client, doc_id="doc-1")
     assert _text(reply) == notice(SERVICE_UNAVAILABLE, "en")

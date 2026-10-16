@@ -13,11 +13,36 @@ Three points the requirements leave open, each with the default this design impl
    "please ask again" notice and the answer is dropped (and logged). Requirement 7.3's follow-up
    message therefore applies to public answers only. Publishing an ephemeral answer into a channel
    would leak exactly what the user asked to keep private.
-3. **Guild scope — the member role is honoured in the configured guild only.** `DISCORD_MEMBER_ROLE_ID`
-   grants members-level access when `interaction.guild_id == DISCORD_GUILD_ID`; every other guild and
-   every DM is public-only, which is also the behaviour when either variable is unset. The
-   conversation cache key stays namespaced per guild (requirement 4.3) because it is a local cache key
-   and costs nothing, but it carries no access meaning.
+3. **Guild scope — access is resolved per guild, from one mapping.** `DISCORD_GUILDS` names each server
+   with the roles it uses (requirement 16); a guild that is not in it, and every DM, is public-only,
+   which is also the behaviour when the variable is empty. The conversation cache key stays namespaced
+   per guild (requirement 4.3) because it is a local cache key and costs nothing, but it carries no
+   access meaning.
+
+Decided with the user on 2026-10-16, when the admin surface was added (requirements 11 to 15):
+
+4. **The admin gate fails closed.** `DISCORD_ADMIN_ROLE_ID` unset means *nobody* is an admin, the
+   inverse of decision 3's member role, where unset means everyone is public. The asymmetry is
+   deliberate: a missing member role withholds access the API would grant anyway to a public caller,
+   while a missing admin role would hand `DELETE /documents` to every member of the server. Refusals
+   happen before any network call, so a refusal cannot be distinguished from a reply by timing.
+5. **An ingest is acknowledged, then reported.** Parsing plus OCR is 10 s/page by budget and a
+   300-page scan is minutes, while an interaction token lives 15 minutes. So the handler defers, hands
+   the work to a background task, and the task edits the acknowledgement; if the token has died it
+   posts to the channel instead. The alternative — holding the deferred reply open — fails exactly on
+   the large scanned documents that OCR exists for, and fails silently.
+6. **URL ingestion gets its own route rather than a widened file route.** `POST /documents` takes
+   `file: UploadFile = File()` as required, and "exactly one of file or url" is not expressible in a
+   FastAPI signature, so the choice would move into validation code and change an existing contract.
+   `POST /documents/url` is additive: the file route, its tests and its callers are untouched.
+7. **Deleting needs a confirmation press.** The API has no undo and the bot cannot re-ingest from a
+   source it does not hold, so `DELETE` is behind a button that names the document and expires.
+8. **One mapping instead of three scalars.** Chosen with the user on 2026-10-16 over keeping
+   `DISCORD_GUILD_ID` / `DISCORD_MEMBER_ROLE_ID` / `DISCORD_ADMIN_ROLE_ID`: role ids are unique to the
+   guild that owns them, so those three names describe exactly one server, and adding a server would
+   have meant a second deployment with a second `.env`. The three names are removed rather than kept
+   alongside the mapping, because two sources of truth for an access rule is how one of them silently
+   wins. Nothing is deployed from this branch, so the rename breaks no live deployment.
 
 ## Overview
 
@@ -112,18 +137,38 @@ src/mcclub_rag/discordbot/
 ### `settings.py` — `BotSettings`
 
 ```python
+@dataclass(frozen=True)
+class GuildAccess:
+    guild_id: int
+    member_role_id: int | None = None
+    admin_role_id: int | None = None
+
+
 class BotSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DISCORD_", env_file=".env", extra="ignore")
     bot_token: str  # DISCORD_BOT_TOKEN, min_length=1
     rag_base_url: str = "http://app:8000"  # DISCORD_RAG_BASE_URL
-    guild_id: int | None = None  # DISCORD_GUILD_ID
-    member_role_id: int | None = None  # DISCORD_MEMBER_ROLE_ID
+    guilds: tuple[GuildAccess, ...] = ()  # DISCORD_GUILDS, "id:member:admin,id::admin"
     user_cooldown_s: float = Field(default=20.0, ge=0)  # DISCORD_USER_COOLDOWN_S
     max_concurrency: int = Field(default=4, gt=0)  # DISCORD_MAX_CONCURRENCY
     api_timeout_s: float = Field(default=60.0, gt=0)  # DISCORD_API_TIMEOUT_S
     member_token: str | None = Field(default=None, validation_alias="MEMBER_TOKEN")
+    admin_api_key: str | None = Field(default=None, validation_alias="ADMIN_API_KEY")
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
+
+    def access_for(self, guild_id: int | None) -> GuildAccess | None:  # None = grants nothing
+        ...
 ```
+
+`DISCORD_GUILDS` is parsed by a `field_validator(mode="before")` into `GuildAccess` entries: the value
+is split on `,`, each entry on `:`, and empty fields become `None`. A malformed or duplicated entry
+raises, naming the entry, so a typo in an access rule fails at startup rather than silently granting
+or withholding access (requirement 16.3). One scalar per guild was the obvious alternative and was
+rejected: a Discord role id belongs to exactly one guild, so `guild_id` + `member_role_id` +
+`admin_role_id` could only ever describe one server.
+
+`admin_api_key` bypasses the prefix the same way `member_token` does, so both processes keep reading
+one `.env` and neither side owns the other's field (`ADMIN_API_KEY` belongs to `config.py`).
 
 `validation_alias` bypasses the `DISCORD_` prefix for the two variables the bot shares with the app,
 whose names `.env` already fixes. `extra="ignore"` lets the bot read the same `.env` the app reads
@@ -166,6 +211,24 @@ class RagClient:
     ) -> ChatOutcome: ...
     async def feedback(self, conversation_id: str, rating: Literal["up", "down"]) -> bool: ...
     async def health(self) -> HealthOutcome: ...
+    async def ingest_file(
+        self,
+        filename: str,
+        data: bytes,
+        *,
+        visibility: Literal["public", "members"],
+        topic: str | None = None,
+    ) -> AdminOutcome: ...
+    async def ingest_url(
+        self, url: str, *, visibility: Literal["public", "members"], topic: str | None = None
+    ) -> AdminOutcome: ...
+    async def list_documents(self) -> DocumentsOutcome: ...
+    async def delete_document(self, doc_id: str) -> AdminOutcome: ...
+```
+
+The admin methods send `X-Admin-Key` from `settings.admin_api_key` and reuse `ApiFailure`, so a
+`401`, `403`, `503`, `422` or an unreachable app becomes the same notice a chat failure does. They
+never raise: one failure code path exists in this module, not two.
 ```
 
 - One `httpx.AsyncClient` for the process lifetime, `timeout=settings.api_timeout_s`, reusing the
@@ -314,9 +377,10 @@ follow-up per channel.
 
 - One `discord.Client` with the default intents and a `CommandTree`; **no** `message_content`, no
   `on_message` handler, so no privileged intent and no Discord verification (requirement 1.2).
-- `is_member(interaction)`: true only when the interaction is in `settings.guild_id`, the user is a
-  `discord.Member`, and one of its roles is `settings.member_role_id` (requirements 3.1, 3.2).
-  DMs and other guilds are public.
+- `is_member(interaction)` and `is_admin(interaction)`: one `settings.access_for(interaction.guild_id)`
+  lookup, then `discord.Member` and a role match (requirements 3.1, 3.2, 11.1). A guild outside the
+  mapping, a DM, a missing role field and the no-guild case all answer `False`, so access is never
+  inherited across servers. `is_admin` is the fail-closed one (decision 4).
 - The `/ask` handler, in order: `is_member` -> `precheck` -> refuse without deferring if it returns a
   notice -> `await interaction.response.defer(ephemeral=not public)` (requirement 1.3) -> `run_ask` ->
   `edit_original_response` for part 0, `followup.send` for the rest -> attach `FeedbackView` to the
@@ -326,11 +390,38 @@ follow-up per channel.
 - Each interaction gets its own `run_ask` coroutine and its own edits, so concurrent channels are
   independent (requirement 1.6).
 - `GuildSlots` is released in a `finally`, so a failed call cannot leak a slot.
-- Registry: `tree.sync(guild=...)` for the configured guild, `tree.sync()` otherwise; sync runs once at
-  startup, not on every reconnect. The guild path must call `tree.copy_global_to(guild=...)` first:
+- Registry: `tree.sync(guild=...)` once per configured guild, `tree.sync()` when none are configured;
+  sync runs once at startup, not on every reconnect. Each guild path must call
+  `tree.copy_global_to(guild=...)` first:
   `@tree.command` registers into the tree's *global* mapping, and discord.py's `_get_all_commands`
   returns only the commands registered *for that guild*, so without the copy the PUT carries an empty
   list and Discord answers 200 while the guild sees nothing (found live on 2026-10-16).
+
+### The admin commands (requirements 12 to 14)
+
+Names below are the contract; `tests/test_bot_admin.py` asserts against them.
+
+- `app.is_admin(interaction, settings)` mirrors `is_member`: the configured guild, a `discord.Member`,
+  and the configured admin role — and `False` when the role is unset (decision 4). It runs before any
+  client call in every admin handler, and the refusal is one ephemeral `notices.ADMIN_ONLY`.
+- `commands.ingest_precheck(filename, url, *, language)` returns the refusal for both-sources or
+  neither, `None` otherwise; pure and synchronous, like `precheck`, so a wrong call costs no request.
+- `commands.run_documents(*, client, language)`, `commands.run_ingest(...)` and
+  `commands.run_forget(*, client, doc_id, language)` return a `RenderedReply` the way `run_status`
+  does, so every admin outcome is testable without a gateway. `commands.forget_confirmation(...)`
+  builds the prompt and its view spec.
+- `render.render_documents(docs)` and `render.render_ingest(reply)` build the embeds:
+  one line per document, "showing N of M" when the listing is truncated, `doc_id` short enough to
+  copy, and a not-found answer that never looks like success.
+- `/ingest` takes `file` (an attachment), `url`, `visibility` and `topic`; `visibility` has no
+  default, since ingesting members-only material as public is invisible to the operator. The handler
+  defers ephemerally, then schedules `app.run_ingest(...)` as a task: the task edits the
+  acknowledgement, and on `discord.NotFound` posts the outcome to the channel (decision 5). A
+  reference to every in-flight task is held in a set, so it cannot be garbage-collected mid-flight.
+- `/forget` replies with `views.DeleteView`, whose button carries the id; the press performs the
+  delete and replaces the view, so one confirmation deletes once (decision 7).
+- Every admin handler logs one event with ids and outcome, never the key, the URL, the filename or the
+  document text.
 
 ### `views.py` — feedback buttons
 
@@ -467,7 +558,7 @@ is followed by another; and the earlier handover note pinned `discord.py~=2.5`, 
 
 | Requirement | Where it is satisfied |
 | --- | --- |
-| 1.1 command surface, guild vs global | `app.py` tree + the three command defs; deployment note above |
+| 1.1 command surface, guild vs global | `app.py` tree + the six command defs; one sync per configured guild |
 | 1.2 slash-only, no privileged intent | `app.py`: default intents, no `on_message` |
 | 1.3 defer before the call | `app.py` handler order; `tests/test_bot_app.py` |
 | 1.4 >2000 chars refused | `commands.precheck`, `notices` |
@@ -480,7 +571,7 @@ is followed by another; and the earlier handover note pinned `discord.py~=2.5`, 
 | 2.5 ephemeral unless public | `AskRequest.public` -> `Message.ephemeral`; attribution line |
 | 2.6 no unused passage text | only `answer` and `sources` are ever rendered |
 | 3.1 member role -> Bearer | `app.is_member` + `RagClient.ask(as_member=)` |
-| 3.2 role configurable | `BotSettings.member_role_id`; unset means public |
+| 3.2 role configurable per guild | `BotSettings.access_for`; a guild with no member role is public |
 | 3.3 401 handling | `client` maps it, `commands` renders the notice, no retry |
 | 4.1 conversation continuity | `ConversationDirectory` + echoed id (see contradiction 1) |
 | 4.2 TTL resets tolerated | unknown id is a valid first turn; cache overwritten |
@@ -498,7 +589,7 @@ is followed by another; and the earlier handover note pinned `discord.py~=2.5`, 
 | 7.3 expired interaction | decision 2 in this document |
 | 7.4 Discord failures contained | `app.py` catches `discord.HTTPException` per handler |
 | 7.5 structlog, nothing sensitive | `configure_logging` reused; the log-event table |
-| 8.1 env-driven config | `BotSettings`; the seven variables already in `.env` are exactly its fields |
+| 8.1 env-driven config | `BotSettings`; `.env.example` documents every field, guarded by a drift test |
 | 8.2 token from the environment only | `BotSettings.bot_token`, never logged or rendered |
 | 8.3 `app:8000` default | `BotSettings.rag_base_url` default; Compose network |
 | 9.1 own container, stack unchanged | the `bot` Compose service; `docker compose up` without it is unchanged |
@@ -508,3 +599,30 @@ is followed by another; and the earlier handover note pinned `discord.py~=2.5`, 
 | 10.1 offline coverage | the test table above, no markers |
 | 10.2 the named cases | the `tests/test_bot_*.py` table |
 | 10.3 e2e untouched | no change under `eval/` |
+| 11.1 admin gate, fail closed | `app.is_admin`; a guild with no admin role -> nobody |
+| 11.2 unset means nobody | decision 4; the `None` branch of `is_admin`; no fallback to member or Discord perms |
+| 11.3 refused before any call | the gate runs before every client call in each admin handler |
+| 11.4 key only on admin calls | `RagClient._admin_auth`; asserted absent from chat/feedback requests |
+| 12.1 compact listing | `render.render_documents` via `commands.run_documents` |
+| 12.2 empty corpus | `notices.NO_DOCUMENTS` |
+| 12.3 truncation stated | "showing N of M" in `render_documents` |
+| 12.4 failures as notices | the shared `ApiFailure` path |
+| 13.1 exactly one source | `commands.ingest_precheck` |
+| 13.2 required visibility | command signature; `visibility` has no default |
+| 13.3 ack, then report | `app.run_ingest` task + the `discord.NotFound` fallback |
+| 13.4 status named | `render.render_ingest` from `commands.run_ingest` |
+| 13.5 failures not retried | one call per command, as with `/ask` |
+| 14.1 confirmation required | `views.DeleteView` over `commands.forget_confirmation` |
+| 14.2 names the document, expires | the view's label and timeout |
+| 14.3 `ok: false` is not found | `commands.run_forget` |
+| 14.4 id copied, not retyped | the id rides the button's `custom_id` |
+| 15.1 new URL route | `api/documents.py::create_document_from_url` |
+| 15.2 one ingest implementation | `DocumentBackend.ingest_url` -> `ingest_pipeline.ingest_url` |
+| 15.3 additive, file route unchanged | the existing route's signature and tests are untouched |
+| 15.4 same codes as the file route | `_raise_for_failed_ingest`, unchanged |
+| 15.5 README corrected | the API table names the two routes |
+| 16.1 mapping grammar | `BotSettings.guilds`; the `field_validator` splitting entry and field |
+| 16.2 empty means none | the `()` default; global registration and public-only access |
+| 16.3 malformed fails fast | the validator's `ValueError`, naming the entry; duplicate ids refused |
+| 16.4 per-guild resolution | `access_for`; `is_member` / `is_admin` read the entry of the asking guild |
+| 16.5 guild before role | both gates compare the guild first; a role id from another entry cannot match |

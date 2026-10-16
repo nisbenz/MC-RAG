@@ -12,8 +12,15 @@ and it stays frozen, so the bot consumes the contract and adds no change to any 
 `src/mcclub_rag/`: the bot is a new, self-contained subpackage that no app module imports. The bot is a **separate process and container**, so the 4 GB / 2-core VPS
 budget, the single-worker app and the CI job list stay as they are.
 
-**Non-goals:** no document upload from Discord (admins keep using `POST /api/v1/documents`), no
-voice, no threads-per-question history beyond the API's 3 turns, no bot-to-bot or webhook ingress.
+**Non-goals:** no voice, no threads-per-question history beyond the API's 3 turns, no bot-to-bot or
+webhook ingress, no document editing in place (an admin re-ingests the source to replace one).
+
+Document *upload* from Discord was a non-goal when this document was written and is one no longer:
+decided with the user on 2026-10-16, the people who hold the corpus are the people in the server, so
+the bot gains `/documents`, `/ingest` and `/forget` behind a dedicated admin role (requirements 11 to
+14). The bot still ingests nothing itself — it calls `POST/GET/DELETE /api/v1/documents` exactly as
+an operator with curl would. URL ingestion is the one addition this needs on the other side of the
+seam, because that route did not exist (requirement 15).
 
 ## Requirements
 
@@ -24,10 +31,11 @@ get an answer without leaving the server.
 
 #### Acceptance Criteria
 
-1. The bot SHALL expose exactly three slash commands — `/ask` (a required `question` string option
-   and an optional `public` boolean), `/reset` and `/status` — and only `/ask` SHALL reach the chat
-   API. WHEN `DISCORD_GUILD_ID` is set THEN the commands SHALL be registered as guild commands, and
-   otherwise SHALL be registered globally.
+1. The bot SHALL expose exactly six slash commands — `/ask` (a required `question` string option and
+   an optional `public` boolean), `/reset`, `/status`, and the admin-only `/documents`, `/ingest` and
+   `/forget` of requirements 12 to 14 — and only `/ask` SHALL reach the chat API. WHEN guilds are
+   configured (requirement 16) THEN the commands SHALL be registered as guild commands in each of
+   them, and otherwise SHALL be registered globally.
 2. The bot SHALL support slash commands only: it SHALL NOT request the Message Content privileged
    intent and SHALL NOT read arbitrary channel messages, so it needs no privileged intent and no
    Discord verification (verification is required past 100 guilds).
@@ -72,13 +80,15 @@ and hidden from everyone else, so that the corpus and the API's access rules sta
 
 #### Acceptance Criteria
 
-1. WHEN the interaction is in `DISCORD_GUILD_ID` AND the asker's Discord account holds the configured
-   member role THEN the bot SHALL send `Authorization: Bearer <MEMBER_TOKEN>`. In every other guild,
-   in a DM, and whenever either id is unset, it SHALL send no header, so the API answers as `public`
-   and members-only documents stay invisible. The token SHALL never be part of a message, an embed or
-   a log line.
-2. The member role id SHALL be configurable (`DISCORD_MEMBER_ROLE_ID`); WHEN it is unset THEN every
-   question SHALL be public, which is the demo default.
+1. WHEN the interaction's guild has a configured member role (requirement 16) AND the asker's
+   Discord account holds it THEN the bot SHALL send `Authorization: Bearer <MEMBER_TOKEN>`. In every
+   other guild, in a DM, in a guild with no member role configured, and whenever no guild is
+   configured at all, it SHALL send no header, so the API answers as `public` and members-only
+   documents stay invisible. The token SHALL never be part of a message, an embed or a log line.
+2. The member role SHALL be configurable per guild (requirement 16); WHEN a guild has none THEN every
+   question from that guild SHALL be public, which is the demo default. Membership SHALL NOT be
+   inherited across guilds: the same person asking from a server that does not grant the role is a
+   public caller.
 3. WHEN the API answers `401 unauthorized` THEN the bot SHALL answer with a short "ask the admins"
    notice, SHALL NOT retry and SHALL NOT echo the token.
 
@@ -169,8 +179,10 @@ the stack, so that it deploys the same way and no secret ends up in the repo.
 #### Acceptance Criteria
 
 1. Configuration SHALL be env-driven and documented in `.env.example` with a comment line each:
-   `DISCORD_BOT_TOKEN`, `DISCORD_RAG_BASE_URL`, `DISCORD_GUILD_ID` (optional), `DISCORD_MEMBER_ROLE_ID`
-   (optional), `DISCORD_USER_COOLDOWN_S`, `DISCORD_MAX_CONCURRENCY`, `DISCORD_API_TIMEOUT_S`.
+   `DISCORD_BOT_TOKEN`, `DISCORD_RAG_BASE_URL`, `DISCORD_GUILDS` (optional, requirement 16),
+   `DISCORD_USER_COOLDOWN_S`, `DISCORD_MAX_CONCURRENCY`, `DISCORD_API_TIMEOUT_S`. `MEMBER_TOKEN` and
+   `ADMIN_API_KEY` SHALL be read through aliases the way `MEMBER_TOKEN` already is, so the app and the
+   bot keep one `.env` and neither side owns the other's field.
 2. The bot SHALL read the token from the environment only. It SHALL never be logged, sent in a
    message, written to a file or committed; `.env` SHALL stay ignored.
 3. `DISCORD_RAG_BASE_URL` SHALL default to `http://app:8000`, so the bot reaches the app over the
@@ -205,5 +217,133 @@ so that the CI job stays fast and offline.
 2. Coverage SHALL include at minimum: role-to-header mapping, `conversation_id` echoing and
    namespacing, cooldown and concurrency refusals, `429` and `5xx` and unreachable handling, answer
    splitting at the Discord limit, grounding label, feedback button wiring and one-shot disabling, and
-   that no log record or message contains the token or the question text.
+   that no log record or message contains the token or the question text. It SHALL additionally cover
+   the admin gate (11), the document listing (12), the one-source rule and the ack-then-post delivery
+   of an ingest (13), the delete confirmation (14), and the new URL route including its failure
+   mapping (15).
 3. The bot SHALL not be scored by the e2e harness; `eval/e2e/` SHALL stay about the API.
+
+### Requirement 11: Who is an admin
+
+**User Story:** As an operator, I want only people I have appointed to change the corpus, so that a
+member cannot ingest or delete documents from the server.
+
+#### Acceptance Criteria
+
+1. WHEN the interaction's guild has a configured admin role (requirement 16) AND the user holds it
+   THEN the admin commands SHALL run. In every other case — another guild, a DM, a missing role, a
+   guild with no admin role configured, and no guilds configured at all — the bot SHALL refuse with a
+   short ephemeral notice and SHALL make no API call at all.
+2. An unset admin role SHALL mean *nobody*, the opposite of the member role (3.2), where unset means
+   everyone: failing closed is the only safe default for an operation that can delete the corpus.
+   Admin rights SHALL NOT be inherited across guilds, and a guild with no admin role SHALL have no
+   admin rather than falling back to the member role or to Discord's own server permissions.
+3. The refusal SHALL be decided before any network call and SHALL NOT reveal whether the API, the
+   key, or the corpus exists.
+4. `ADMIN_API_KEY` SHALL be sent as `X-Admin-Key` for admin calls only and SHALL never be logged,
+   echoed, or attached to a chat or feedback request.
+
+### Requirement 12: Listing the corpus
+
+**User Story:** As an admin, I want to see what the bot knows, so that a question I cannot answer
+leads me to a missing document instead of a guess.
+
+#### Acceptance Criteria
+
+1. `/documents` SHALL call `GET /api/v1/documents` and render each document compactly: title,
+   visibility, status, chunk count, created date, topic, and `expires_at` when set.
+2. WHEN the corpus is empty THEN the bot SHALL answer with a notice, not an empty embed.
+3. WHEN the listing exceeds what one Discord message holds THEN the bot SHALL state how many of how
+   many are shown, in order, and SHALL never drop documents silently.
+4. A failure SHALL follow requirement 7's mapping: one localized notice and no traceback.
+
+### Requirement 13: Ingesting a document
+
+**User Story:** As an admin, I want to hand the bot a file or a URL from Discord, so that a document a
+member mentions can be in the corpus without shell access to the server.
+
+#### Acceptance Criteria
+
+1. `/ingest` SHALL accept exactly one source — an attachment, or a `url` string — and SHALL refuse
+   both-at-once and neither, ephemerally, before any API call.
+2. It SHALL take a required `visibility` (`public` / `members`), since ingesting members-only material
+   as public is a leak the operator cannot see, and an optional `topic` so re-ingesting a source
+   replaces it (the `doc_id` derives from the topic).
+3. The bot SHALL acknowledge within Discord's 3-second window and SHALL then run the ingest as a
+   background task, because parsing and OCR of a large scan take minutes and an interaction token
+   lives 15: WHEN the ingest finishes THEN the bot SHALL edit its own acknowledgement; WHEN the
+   interaction has expired THEN it SHALL post the outcome to the channel, naming the document, so an
+   operator is never left unable to tell whether the corpus changed.
+4. The outcome SHALL name the `doc_id` and whether the ingest succeeded, and a refused or `failed`
+   ingest SHALL be reported with its localized error code as a failure, never as success.
+
+   It SHALL NOT claim to say whether the document was newly indexed, replaced or already a
+   duplicate: `POST /api/v1/documents` answers `{doc_id}` and nothing else
+   (`DocumentCreateResponse`), so the API does not tell the bot which of the three happened.
+   Recorded in EDGE_CASES.md with the one-line API change that would fix it, should the operator
+   want it.
+5. A refusal by the API (`file_too_large`, `unsupported_file_type`, `parse_error`, `empty_document`,
+   `url_not_allowed`, `fetch_error`, `index_unavailable`) SHALL be surfaced as its localized notice
+   and SHALL NOT be retried.
+
+### Requirement 14: Deleting a document
+
+**User Story:** As an admin, I want to remove a document from Discord, so that content that must not
+be served (expired, wrong version, privacy) can be taken out of the corpus quickly.
+
+#### Acceptance Criteria
+
+1. `/forget` SHALL take a required `doc_id` and SHALL require an explicit confirmation press before
+   calling `DELETE /api/v1/documents/{doc_id}`, because deletion cannot be undone through the bot.
+2. The confirmation SHALL name the document (its title when the listing has it) and SHALL expire, so
+   a stale confirmation cannot delete something else later.
+3. WHEN the API answers `{"ok": false}` THEN the bot SHALL report "not found", which is not success.
+4. A completed delete SHALL be reported ephemerally with the id, and the id SHALL be copied from the
+   listing or the ingest result rather than retyped: an id that never existed and an id that was
+   removed looking identical is how the wrong document gets deleted from a list.
+
+### Requirement 15: Ingesting a URL through the API
+
+**User Story:** As an operator, I want the URL path reachable over HTTP like the file path, so that
+the bot can ingest a page without a second implementation of fetching and security checks.
+
+#### Acceptance Criteria
+
+1. `POST /api/v1/documents/url` SHALL be added, admin-only like the file route (`X-Admin-Key`),
+   taking form fields `url` (required), `visibility` (required), `topic` and `expires_at`, and
+   returning `{doc_id}` exactly as the file route does.
+2. It SHALL call `DocumentBackend.ingest_url` — a method the protocol gains — implemented by
+   `RealDocumentBackend` over `ingest_pipeline.ingest_url`, so the SSRF guard, the redirect checks, the
+   page and size limits, the docstore write and the marker ordering stay the pipeline's, not a second
+   implementation's.
+3. The existing `POST /api/v1/documents` contract SHALL NOT change: the new route SHALL be additive,
+   so no current client or test breaks. A separate route is chosen because the file route's `file` is
+   a required field and "exactly one of file or url" cannot be expressed in a signature.
+4. Failures SHALL use the same stable codes and statuses as the file route, and a `failed` result
+   SHALL be raised as an `IngestError` rather than returned as `200`, matching the file route's
+   `_raise_for_failed_ingest`.
+5. README's claim that the file route accepts "a file or URL" SHALL be corrected to name the two
+   routes, so the documented surface matches the code.
+
+### Requirement 16: Several servers, each with its own roles
+
+**User Story:** As an operator, I want to run one bot in the guilds I choose with the roles each one
+uses, so that adding a server does not mean a second deployment or a shared access rule.
+
+#### Acceptance Criteria
+
+1. `DISCORD_GUILDS` SHALL hold one entry per server as `guild_id:member_role_id:admin_role_id`, entries
+   separated by `,`, where an empty field means "not configured for this guild" and trailing empty
+   fields may be left off (`123:456` and `123:456:` are the same, and `123::789` grants an admin role
+   with no member role). Every field is a Discord snowflake.
+2. WHEN `DISCORD_GUILDS` is unset or empty THEN no guild SHALL be configured: every guild and every
+   DM SHALL be public-only, no one SHALL be an admin, and the commands SHALL register globally.
+3. A malformed entry — a non-numeric field, the wrong number of fields, or a duplicate `guild_id` —
+   SHALL fail at startup with a message naming the offending entry, because a typo in an access rule
+   is a security bug that silence would hide.
+4. Access SHALL be resolved per guild: the member role (3.1) and the admin role (11.1) SHALL be read
+   from the entry of the guild the interaction came from. A guild absent from the mapping SHALL grant
+   nothing, so the same person in a different server is a public caller.
+5. Role ids SHALL be treated as belonging to their own guild: because a Discord role id is unique to
+   the guild that owns it, one entry's role can never match a role in another guild, and the guild
+   check SHALL be made before any role check.

@@ -1,5 +1,13 @@
 """What a member sees: grounding, sources, splitting, language (Req 2)."""
 
+from mcclub_rag.discordbot.notices import (
+    DELETE_DONE,
+    DELETE_NOT_FOUND,
+    INGEST_DONE,
+    INGEST_FAILED,
+    NO_DOCUMENTS,
+    notice,
+)
 from mcclub_rag.discordbot.render import (
     CONTINUATION_MARK,
     EMBED_DESCRIPTION_LIMIT,
@@ -7,12 +15,17 @@ from mcclub_rag.discordbot.render import (
     MESSAGE_CONTENT_LIMIT,
     UNGROUNDED_COLOUR,
     RenderedReply,
+    delete_result_reply,
+    document_line,
+    ingest_failure_reply,
     notice_reply,
     render_answer,
+    render_documents,
+    render_ingest,
     split_text,
 )
 from mcclub_rag.schemas import Source
-from tests.bot_fakes import ANSWER_TEXT, chat_response
+from tests.bot_fakes import ANSWER_TEXT, chat_response, doc_info
 
 ARABIC_ANSWER = "يجتمع النادي كل ثلاثاء في الورشة، والدخول مجاني للأعضاء."
 LONG_ANSWER = "\n\n".join(f"فقرة {index} " + "x" * 300 for index in range(20))
@@ -170,3 +183,84 @@ def test_notice_reply_has_no_embed_and_is_ephemeral() -> None:
     assert reply.parts[0].embed is None
     assert reply.parts[0].ephemeral is True
     assert reply.feedback is None
+
+
+# --- The admin surfaces (requirements 12 to 14) -----------------------------------------------
+
+
+def _listing(reply: RenderedReply) -> list[str]:
+    return [part.embed.description for part in reply.parts if part.embed is not None]
+
+
+def test_a_listing_line_carries_the_id_visibility_and_status() -> None:
+    line = document_line(doc_info(topic="rules", expires_at="2026-12-01"))
+    assert "**Club rules**" in line
+    assert "public" in line and "indexed" in line
+    assert "12 chunk(s)" in line
+    assert "topic: rules" in line
+    assert "expires: 2026-12-01" in line
+    assert "`doc-1`" in line
+
+
+def test_a_listing_line_falls_back_to_the_id_when_the_title_is_empty() -> None:
+    assert "**doc-9**" in document_line(doc_info("doc-9", title=""))
+
+
+def test_an_empty_corpus_is_a_notice() -> None:
+    """Req 12.2: not an empty embed."""
+    reply = render_documents([])
+    assert reply.parts[0].embed is None
+    assert reply.parts[0].content == notice(NO_DOCUMENTS, "en")
+
+
+def test_a_long_listing_is_paginated_without_dropping_a_document() -> None:
+    """Req 12.3: every document appears once, and each part says how many of how many."""
+    docs = [doc_info(f"doc-{index}", title=f"Title {index}" + "x" * 60) for index in range(200)]
+    reply = render_documents(docs)
+    assert len(reply.parts) > 1
+    for part in reply.parts:
+        assert part.embed is not None
+        assert part.embed.description
+        assert len(part.embed.description) <= EMBED_DESCRIPTION_LIMIT
+        assert part.embed.footer is not None
+        assert part.embed.footer.startswith("showing ")
+        assert part.embed.footer.endswith(" of 200")
+    rendered = "\n".join(_listing(reply))
+    for index in range(200):
+        assert rendered.count(f"`doc-{index}`") == 1
+
+
+def test_every_listing_part_is_ephemeral() -> None:
+    reply = render_documents([doc_info(f"doc-{i}") for i in range(120)])
+    assert len(reply.parts) > 1
+    assert all(part.ephemeral for part in reply.parts)
+
+
+def test_the_last_listing_part_ends_at_the_total() -> None:
+    reply = render_documents([doc_info(f"doc-{i}", title="T" + "y" * 80) for i in range(90)])
+    assert reply.parts[-1].embed is not None
+    assert reply.parts[-1].embed.footer.endswith("of 90")
+
+
+def test_a_finished_ingest_names_the_id_and_the_visibility() -> None:
+    reply = render_ingest(name="rules.pdf", visibility="members", doc_id="doc-new")
+    assert reply.parts[0].content == notice(
+        INGEST_DONE, "en", name="rules.pdf", visibility="members", doc_id="doc-new"
+    )
+    assert "indexed" not in reply.parts[0].content  # the API does not say (Req 13.4)
+
+
+def test_a_failed_ingest_carries_the_apis_code() -> None:
+    reply = ingest_failure_reply("rules.pdf", "parse_error")
+    assert reply.parts[0].content == notice(
+        INGEST_FAILED, "en", name="rules.pdf", reason="parse_error"
+    )
+
+
+def test_a_delete_result_reads_as_done_or_as_missing() -> None:
+    assert delete_result_reply("doc-1", True).parts[0].content == notice(
+        DELETE_DONE, "en", doc_id="doc-1"
+    )
+    assert delete_result_reply("doc-1", False).parts[0].content == notice(
+        DELETE_NOT_FOUND, "en", doc_id="doc-1"
+    )

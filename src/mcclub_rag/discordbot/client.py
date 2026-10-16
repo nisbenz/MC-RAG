@@ -11,11 +11,19 @@ from typing import Literal
 import httpx
 from pydantic import ValidationError
 
-from mcclub_rag.schemas import ChatResponse, HealthStatus
+from mcclub_rag.schemas import (
+    ChatResponse,
+    DocInfo,
+    DocumentCreateResponse,
+    HealthStatus,
+    Visibility,
+)
 
 CHAT_PATH = "/api/v1/chat"
 FEEDBACK_PATH = "/api/v1/feedback"
 HEALTH_PATH = "/api/v1/health"
+DOCUMENTS_PATH = "/api/v1/documents"
+DOCUMENTS_URL_PATH = "/api/v1/documents/url"
 
 FeedbackRating = Literal["up", "down"]
 
@@ -50,6 +58,21 @@ class HealthOutcome:
     failure: ApiFailure | None = None
 
 
+@dataclass(frozen=True)
+class AdminOutcome:
+    """An ingest or a delete: either a result or a failure, never both, never an exception."""
+
+    doc_id: str | None = None
+    deleted: bool | None = None
+    failure: ApiFailure | None = None
+
+
+@dataclass(frozen=True)
+class DocumentsOutcome:
+    documents: list[DocInfo] | None = None
+    failure: ApiFailure | None = None
+
+
 class RagClient:
     def __init__(
         self,
@@ -57,9 +80,15 @@ class RagClient:
         *,
         timeout_s: float,
         member_token: str | None = None,
+        admin_api_key: str | None = None,
+        admin_timeout_s: float | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._member_token = member_token
+        self._admin_api_key = admin_api_key
+        # An ingest answers only after parsing, OCR and embedding, so it gets its own budget: the
+        # chat timeout would abandon every real document while the API went on to index it.
+        self._admin_timeout = admin_timeout_s or timeout_s
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             timeout=timeout_s,
@@ -118,9 +147,96 @@ class RagClient:
         except (ValueError, KeyError, TypeError):
             return HealthOutcome(failure=ApiFailure("internal", response.status_code))
 
+    async def ingest_file(
+        self,
+        filename: str,
+        data: bytes,
+        *,
+        visibility: Visibility,
+        topic: str | None = None,
+    ) -> AdminOutcome:
+        """`POST /api/v1/documents` with the bytes as the multipart `file` part (Req 13.1)."""
+        try:
+            response = await self._client.post(
+                DOCUMENTS_PATH,
+                data=_document_form(visibility, topic),
+                files={"file": (filename, data)},
+                headers=self._admin_auth(),
+                timeout=self._admin_timeout,
+            )
+        except httpx.TimeoutException:
+            return AdminOutcome(failure=ApiFailure("timeout"))
+        except httpx.HTTPError:
+            return AdminOutcome(failure=ApiFailure("unreachable"))
+        return _created(response)
+
+    async def ingest_url(
+        self,
+        url: str,
+        *,
+        visibility: Visibility,
+        topic: str | None = None,
+    ) -> AdminOutcome:
+        """`POST /api/v1/documents/url` (Req 15.1). The URL is fetched by the API, never here."""
+        form = _document_form(visibility, topic)
+        form["url"] = url
+        try:
+            response = await self._client.post(
+                DOCUMENTS_URL_PATH,
+                data=form,
+                headers=self._admin_auth(),
+                timeout=self._admin_timeout,
+            )
+        except httpx.TimeoutException:
+            return AdminOutcome(failure=ApiFailure("timeout"))
+        except httpx.HTTPError:
+            return AdminOutcome(failure=ApiFailure("unreachable"))
+        return _created(response)
+
+    async def list_documents(self) -> DocumentsOutcome:
+        """`GET /api/v1/documents` (Req 12.1)."""
+        try:
+            response = await self._client.get(DOCUMENTS_PATH, headers=self._admin_auth())
+        except httpx.TimeoutException:
+            return DocumentsOutcome(failure=ApiFailure("timeout"))
+        except httpx.HTTPError:
+            return DocumentsOutcome(failure=ApiFailure("unreachable"))
+        if response.status_code != httpx.codes.OK:
+            return DocumentsOutcome(failure=self._failure(response))
+        try:
+            return DocumentsOutcome(
+                documents=[DocInfo.model_validate(item) for item in response.json()]
+            )
+        except (ValueError, ValidationError, TypeError):
+            return DocumentsOutcome(failure=ApiFailure("internal", response.status_code))
+
+    async def delete_document(self, doc_id: str) -> AdminOutcome:
+        """`DELETE /api/v1/documents/{doc_id}`; `{"ok": false}` is a miss (Req 14.3)."""
+        try:
+            response = await self._client.delete(
+                f"{DOCUMENTS_PATH}/{doc_id}",
+                headers=self._admin_auth(),
+            )
+        except httpx.TimeoutException:
+            return AdminOutcome(failure=ApiFailure("timeout"))
+        except httpx.HTTPError:
+            return AdminOutcome(failure=ApiFailure("unreachable"))
+        if response.status_code != httpx.codes.OK:
+            return AdminOutcome(failure=self._failure(response))
+        try:
+            return AdminOutcome(deleted=bool(response.json()["ok"]))
+        except (ValueError, KeyError, TypeError):
+            return AdminOutcome(failure=ApiFailure("internal", response.status_code))
+
     def _auth(self, as_member: bool) -> dict[str, str]:
         if as_member and self._member_token:
             return {"Authorization": f"Bearer {self._member_token}"}
+        return {}
+
+    def _admin_auth(self) -> dict[str, str]:
+        """Req 11.4: the admin key rides admin calls only, never a chat or feedback request."""
+        if self._admin_api_key:
+            return {"X-Admin-Key": self._admin_api_key}
         return {}
 
     @staticmethod
@@ -131,3 +247,20 @@ class RagClient:
         except (ValueError, KeyError, TypeError):
             return ApiFailure(fallback, response.status_code)
         return ApiFailure(code if isinstance(code, str) else fallback, response.status_code)
+
+
+def _document_form(visibility: Visibility, topic: str | None) -> dict[str, str]:
+    """The form fields both ingest routes share. An absent topic is left out, not sent empty."""
+    form = {"visibility": visibility}
+    if topic:
+        form["topic"] = topic
+    return form
+
+
+def _created(response: httpx.Response) -> AdminOutcome:
+    if response.status_code != httpx.codes.OK:
+        return AdminOutcome(failure=RagClient._failure(response))
+    try:
+        return AdminOutcome(doc_id=DocumentCreateResponse.model_validate(response.json()).doc_id)
+    except (ValueError, ValidationError):
+        return AdminOutcome(failure=ApiFailure("internal", response.status_code))

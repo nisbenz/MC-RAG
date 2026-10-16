@@ -6,8 +6,17 @@ The Discord types only appear in `app.py`, which sends what this module produced
 
 from dataclasses import dataclass
 
-from mcclub_rag.discordbot.notices import NOT_GROUNDED, NoticeLanguage, notice
-from mcclub_rag.schemas import ChatResponse, Source, Usage
+from mcclub_rag.discordbot.notices import (
+    DELETE_DONE,
+    DELETE_NOT_FOUND,
+    INGEST_DONE,
+    INGEST_FAILED,
+    NO_DOCUMENTS,
+    NOT_GROUNDED,
+    NoticeLanguage,
+    notice,
+)
+from mcclub_rag.schemas import ChatResponse, DocInfo, Source, Usage
 
 EMBED_DESCRIPTION_LIMIT = 4000  # Discord's embed description cap
 MESSAGE_CONTENT_LIMIT = 1900  # under Discord's 2000 so a `…` marker still fits
@@ -18,6 +27,7 @@ CONTINUATION_MARK = "\u2026"
 SOURCE_FALLBACK = "Source"
 GROUNDED_COLOUR = 0x2ECC71
 UNGROUNDED_COLOUR = 0x95A5A6
+LIST_COLOUR = 0x3498DB
 
 
 @dataclass(frozen=True)
@@ -112,6 +122,73 @@ def usage_footer(usage: Usage, grounded: bool, *, part: int = 1, total: int = 1)
     if total > 1:
         return f"part {part} of {total} · {footer}"
     return footer
+
+
+def document_line(doc: DocInfo) -> str:
+    """One document per block, id included: `doc_id` is the only handle `/forget` accepts."""
+    summary = [f"**{doc.title or doc.doc_id}**", doc.visibility, doc.status]
+    summary.append(f"{doc.chunk_count} chunk(s)")
+    if doc.topic:
+        summary.append(f"topic: {doc.topic}")
+    if doc.expires_at:
+        summary.append(f"expires: {doc.expires_at}")
+    return f"{' · '.join(summary)}\n`{doc.doc_id}`"
+
+
+def render_documents(docs: list[DocInfo], *, language: NoticeLanguage = "en") -> RenderedReply:
+    """The corpus listing, split across parts so no document is dropped (Req 12.1-12.3)."""
+    if not docs:
+        return notice_reply(notice(NO_DOCUMENTS, language))
+    blocks = [document_line(doc) for doc in docs]
+    pages: list[tuple[list[str], int]] = []
+    current: list[str] = []
+    length = 0
+    for block in blocks:
+        if current and length + len(block) + 2 > EMBED_DESCRIPTION_LIMIT:
+            pages.append((current, length))
+            current, length = [], 0
+        current.append(block)
+        length += len(block) + 2
+    if current:
+        pages.append((current, length))
+    seen = 0
+    parts: list[Message] = []
+    for page, _ in pages:
+        first = seen + 1
+        seen += len(page)
+        footer = f"showing {first}-{seen} of {len(docs)}"
+        parts.append(
+            Message(
+                content="",
+                embed=EmbedSpec(description="\n\n".join(page), footer=footer, colour=LIST_COLOUR),
+                ephemeral=True,
+            )
+        )
+    return RenderedReply(parts=tuple(parts))
+
+
+def render_ingest(
+    *, name: str, visibility: str, doc_id: str, language: NoticeLanguage = "en"
+) -> RenderedReply:
+    """What an ingest did. The API says `{doc_id}` only, so neither does this (Req 13.4)."""
+    return notice_reply(
+        notice(INGEST_DONE, language, name=name, visibility=visibility, doc_id=doc_id)
+    )
+
+
+def ingest_failure_reply(
+    name: str, reason: str, *, language: NoticeLanguage = "en"
+) -> RenderedReply:
+    """A refused call or a `failed` ingest: never rendered as success (Req 13.4, 13.5)."""
+    return notice_reply(notice(INGEST_FAILED, language, name=name, reason=reason))
+
+
+def delete_result_reply(
+    doc_id: str, deleted: bool, *, language: NoticeLanguage = "en"
+) -> RenderedReply:
+    """Req 14.3: `{\"ok\": false}` is a miss and must not read as a successful delete."""
+    table = DELETE_DONE if deleted else DELETE_NOT_FOUND
+    return notice_reply(notice(table, language, doc_id=doc_id))
 
 
 def split_text(text: str, limit: int = MESSAGE_CONTENT_LIMIT) -> list[str]:

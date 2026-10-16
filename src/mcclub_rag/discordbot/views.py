@@ -18,7 +18,9 @@ import discord
 import structlog
 
 from mcclub_rag.discordbot.client import FeedbackRating, RagClient
+from mcclub_rag.discordbot.commands import run_forget
 from mcclub_rag.discordbot.notices import (
+    DELETE_CANCELLED,
     FEEDBACK_FAILED,
     FEEDBACK_RECORDED,
     NoticeLanguage,
@@ -31,6 +33,11 @@ FEEDBACK_PREFIX = "mcclub:fb"
 UP_LABEL = "\U0001f44d"
 DOWN_LABEL = "\U0001f44e"
 _RATINGS: tuple[FeedbackRating, ...] = ("up", "down")
+
+DELETE_PREFIX = "mcclub:del"
+CONFIRM_LABEL = "Delete"
+CANCEL_LABEL = "Cancel"
+CONFIRM_TIMEOUT_S = 120  # a stale confirmation must not delete something else later (Req 14.2)
 
 
 @dataclass(frozen=True)
@@ -118,3 +125,65 @@ class FeedbackView(discord.ui.View):
         else:
             await interaction.response.edit_message(view=self)
             await interaction.followup.send(text, ephemeral=True)
+
+
+def delete_custom_id(doc_id: str) -> str:
+    """The id rides the button, so a press deletes what the prompt named and nothing retyped."""
+    return f"{DELETE_PREFIX}:{doc_id}"
+
+
+def parse_delete_custom_id(value: str) -> str | None:
+    """`None` for anything that is not ours, so a malformed press never deletes."""
+    prefix, _, doc_id = value.partition(":")
+    if prefix != DELETE_PREFIX or not doc_id:
+        return None
+    return doc_id
+
+
+class DeleteView(discord.ui.View):
+    """One confirmation, then gone (Req 14.1, 14.2).
+
+    Deleting cannot be undone through the bot, so the press is the only way to reach the API's
+    `DELETE`, and the view stops listening after `CONFIRM_TIMEOUT_S`.
+    """
+
+    def __init__(
+        self,
+        doc_id: str,
+        *,
+        client: RagClient | None = None,
+        language: NoticeLanguage = "en",
+    ) -> None:
+        super().__init__(timeout=CONFIRM_TIMEOUT_S)
+        self.doc_id = doc_id
+        self._client = client
+        self._language = language
+        self.add_item(self._button(CONFIRM_LABEL, discord.ButtonStyle.danger))
+        self.add_item(self._button(CANCEL_LABEL, discord.ButtonStyle.secondary))
+
+    def _button(self, label: str, style: discord.ButtonStyle) -> discord.ui.Button:
+        button = discord.ui.Button(
+            label=label, style=style, custom_id=delete_custom_id(self.doc_id)
+        )
+
+        async def callback(interaction: discord.Interaction) -> None:
+            await self.press(interaction, label == CONFIRM_LABEL)
+
+        button.callback = callback
+        return button
+
+    async def press(self, interaction: discord.Interaction, confirmed: bool) -> None:
+        """Delete on a confirmation, report either way, and leave the prompt unpressable."""
+        await interaction.response.defer(ephemeral=True)
+        if not confirmed:
+            self.stop()
+            await interaction.edit_original_response(
+                content=notice(DELETE_CANCELLED, self._language), view=None
+            )
+            return
+        if self._client is None:  # unreachable from build_client, which always passes one
+            log.warning("bot_delete_without_client")
+            return
+        self.stop()
+        reply = await run_forget(client=self._client, doc_id=self.doc_id, language=self._language)
+        await interaction.edit_original_response(content=reply.parts[0].content, view=None)

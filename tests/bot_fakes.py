@@ -8,8 +8,13 @@ from typing import Any
 
 import discord
 
-from mcclub_rag.discordbot.client import ChatOutcome, HealthOutcome
-from mcclub_rag.schemas import ChatResponse, Source, Usage
+from mcclub_rag.discordbot.client import (
+    AdminOutcome,
+    ChatOutcome,
+    DocumentsOutcome,
+    HealthOutcome,
+)
+from mcclub_rag.schemas import ChatResponse, DocInfo, Source, Usage
 
 ANSWER_TEXT = "The club meets on Tuesdays at the workshop."
 SNIPPET_TEXT = "We meet on Tuesdays."
@@ -37,6 +42,29 @@ def chat_response(
     )
 
 
+def doc_info(
+    doc_id: str = "doc-1",
+    *,
+    title: str = "Club rules",
+    visibility: str = "public",
+    status: str = "indexed",
+    chunk_count: int = 12,
+    created_at: str = "2026-10-16T10:00:00Z",
+    topic: str | None = None,
+    expires_at: str | None = None,
+) -> DocInfo:
+    return DocInfo(
+        doc_id=doc_id,
+        title=title,
+        visibility=visibility,  # type: ignore[arg-type]
+        status=status,
+        chunk_count=chunk_count,
+        created_at=created_at,
+        topic=topic,
+        expires_at=expires_at,
+    )
+
+
 class FakeRagClient:
     """Records what the bot asked for, and returns whatever the test set up."""
 
@@ -46,16 +74,26 @@ class FakeRagClient:
         *,
         health: HealthOutcome | None = None,
         feedback_ok: bool = True,
+        documents: DocumentsOutcome | None = None,
+        admin: AdminOutcome | None = None,
         events: list[str] | None = None,
     ) -> None:
         self.outcome = outcome if outcome is not None else ChatOutcome(response=chat_response())
         self.health_outcome = (
             health if health is not None else HealthOutcome(status="ok", documents=60)
         )
+        self.documents_outcome = (
+            documents if documents is not None else DocumentsOutcome(documents=[doc_info()])
+        )
+        self.admin_outcome = admin if admin is not None else AdminOutcome(doc_id="doc-new")
         self.feedback_ok = feedback_ok
         self.asks: list[dict[str, Any]] = []
         self.ratings: list[tuple[str, str]] = []
         self.health_calls = 0
+        self.ingests: list[dict[str, Any]] = []
+        self.deletes: list[str] = []
+        self.list_calls = 0
+        self.aclosed = False
         self.events = events if events is not None else []
 
     async def ask(
@@ -80,7 +118,40 @@ class FakeRagClient:
         self.health_calls += 1
         return self.health_outcome
 
+    async def ingest_file(
+        self, filename: str, data: bytes, *, visibility: str, topic: str | None = None
+    ) -> AdminOutcome:
+        self.ingests.append(
+            {
+                "kind": "file",
+                "filename": filename,
+                "data": data,
+                "visibility": visibility,
+                "topic": topic,
+            }
+        )
+        self.events.append("ingest_file")
+        return self.admin_outcome
+
+    async def ingest_url(
+        self, url: str, *, visibility: str, topic: str | None = None
+    ) -> AdminOutcome:
+        self.ingests.append({"kind": "url", "url": url, "visibility": visibility, "topic": topic})
+        self.events.append("ingest_url")
+        return self.admin_outcome
+
+    async def list_documents(self) -> DocumentsOutcome:
+        self.list_calls += 1
+        self.events.append("list_documents")
+        return self.documents_outcome
+
+    async def delete_document(self, doc_id: str) -> AdminOutcome:
+        self.deletes.append(doc_id)
+        self.events.append("delete_document")
+        return self.admin_outcome
+
     async def aclose(self) -> None:
+        self.aclosed = True
         self.events.append("aclose")
 
 
@@ -103,6 +174,7 @@ class FakeResponse:
         self.events = events if events is not None else []
         self.deferred: bool | None = None
         self.sent: list[tuple[str | None, bool]] = []
+        self.raw: list[dict[str, Any]] = []  # the same sends with every kwarg, `view` included
         self.edits: list[dict[str, Any]] = []
         self._done = False
 
@@ -118,6 +190,7 @@ class FakeResponse:
         self, content: str | None = None, *, ephemeral: bool = False, **kwargs: Any
     ) -> None:
         self.sent.append((content, ephemeral))
+        self.raw.append({"content": content, "ephemeral": ephemeral, **kwargs})
         self._done = True
         self.events.append("send_message")
 
@@ -160,17 +233,23 @@ class FakeInteraction:
         user: FakeUser | None = None,
         guild_id: int | None = 42,
         channel_id: int | None = 99,
+        locale: str = "en-US",
         events: list[str] | None = None,
     ) -> None:
         self.events = events if events is not None else []
         self.user = user if user is not None else FakeUser()
         self.guild_id = guild_id
         self.channel_id = channel_id
+        self.locale = locale
         self.response = FakeResponse(self.events)
         self.followup = FakeFollowup(self.events)
         self.channel = FakeChannel(self.events)
+        # Set by a test that wants the 15-minute token to have died before the work finished.
+        self.expired = False
 
     async def edit_original_response(self, **kwargs: Any) -> None:
+        if self.expired:
+            raise expired_interaction_error()
         self.response.edits.append(kwargs)
         self.events.append("edit_original_response")
 

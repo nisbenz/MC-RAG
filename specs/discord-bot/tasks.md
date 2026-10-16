@@ -124,9 +124,112 @@ every interface named below.
     drift
   - _Requirements: 8.1_
 
-- [x] 13. Integration
-- [x] 13.1 Add the end-to-end wiring test: the real `RagClient` over `httpx.MockTransport` into
-  `run_ask`, through `FakeInteraction`, asserting the `precheck -> defer -> one call -> edit` sequence
-  and the rendered answer in one pass
-  - Run `uv lock --check`, `ruff check .`, `ruff format --check .` and the fast pytest job
-  - _Requirements: 1.3, 7.1, 10.1, 10.2_
+- [x] 14. The guild mapping and admin identity (requirements 11, 16)
+- [x] 14.1 Replace the three guild scalars with `DISCORD_GUILDS` and `GuildAccess`
+  - Grammar `guild_id:member_role_id:admin_role_id`, comma-separated, an empty field means "not
+    configured for this guild", trailing empty fields optional
+  - A malformed entry, a wrong field count or a duplicate guild id fails at startup naming the entry,
+    because a typo in an access rule is a security bug
+  - `DISCORD_GUILD_ID`, `DISCORD_MEMBER_ROLE_ID` and `DISCORD_ADMIN_ROLE_ID` are removed rather than
+    kept alongside, so no access rule has two sources of truth
+  - `NoDecode` is required on the field: pydantic-settings JSON-decodes a complex type in the source,
+    before any validator, so `42:7` reached the validator as an already-failed decode (proved with the
+    installed 2.15.0; see EDGE_CASES.md)
+  - Tests: `123:456`, `123:456:`, `123::789` and a two-guild value; empty means no guilds; malformed,
+    non-numeric, three-field-overflow and duplicate entries refused; `access_for` for a guild outside
+    the mapping returns `None`; the alias and blank-handling rules from 2.1 still hold
+  - _Requirements: 8.1, 16.1, 16.2, 16.3, 16.4_
+
+- [x] 14.2 Per-guild `is_member` / `is_admin`, and registration in every configured guild
+  - Both gates resolve their guild through `access_for`, compare the guild before any role, and answer
+    `False` for a guild outside the mapping, a DM, a missing role field and the no-guild case
+  - `sync_commands` registers in each configured guild with `copy_global_to`, and globally when none
+    are configured
+  - `_admin_auth()` sends `X-Admin-Key`; the chat and feedback paths never see it
+  - Tests: a role in one guild granting nothing in another, a guild with no member role staying public,
+    a guild with no admin role having no admin, one registration per configured guild, the key absent
+    from a chat request, and no log record containing the key or the URL
+  - _Requirements: 11.1, 11.2, 11.3, 11.4, 16.4, 16.5_
+
+- [x] 15. Admin commands (requirements 12, 13, 14)
+- [x] 15.1 Client methods and outcomes for the document routes
+  - `ingest_file` (multipart), `ingest_url`, `list_documents`, `delete_document`, each returning an
+    outcome carrying either the payload or an `ApiFailure`, never raising; an ingest uses
+    `DISCORD_ADMIN_TIMEOUT_S` because parsing and OCR happen inside that one request
+  - Tests over `httpx.MockTransport`: multipart field names and the `visibility` form value, the
+    header on every admin call, `401` / `403` / `422` / `503` / unreachable mapping, `ok: false`
+    distinguished from `ok: true`, and a malformed body becoming `internal` rather than a traceback
+  - _Requirements: 12.1, 12.4, 13.1, 13.4, 14.3_
+
+- [x] 15.2 Pure command logic
+  - `ingest_precheck` refuses both sources and neither; `run_documents`, `run_ingest` and `run_forget`
+    return `RenderedReply`; `forget_confirmation` builds the prompt the view rides on
+  - Tests: both-or-neither refusals carry no API call, an empty corpus answers with the notice, a long
+    listing states how many of how many, `failed` is never rendered as success, a refused key is not
+    blamed on the document, and a completed delete names the id
+  - _Requirements: 12.2, 12.3, 13.4, 14.2, 14.4_
+
+- [x] 15.3 Wiring: handlers, the background ingest task and the confirmation view
+  - `/documents` answers synchronously; `/ingest` defers, schedules the task, and reports by editing
+    the acknowledgement, falling back to a channel message when the interaction has expired;
+    `/forget` confirms through `DeleteView` and replaces the view on press
+  - Tasks are held in a set so they cannot be collected mid-flight
+  - The gate runs before `defer()`: a refusal costs no interaction and no API call
+  - Tests through `tests/bot_fakes.py`: the gate runs first, the defer and the acknowledgement precede
+    the call, an expired interaction posts to the channel and an undeliverable one is logged, one press
+    deletes once, `{"ok": false}` is not a delete, and a refused call leaves the corpus alone
+  - _Requirements: 13.3, 14.1_
+
+- [x] 15.4 Notices and rendering for the new outcomes
+  - `notices`: admin-only, admin-refused, no documents, one-source, ingest started/done/failed, delete
+    confirm / done / not-found / cancelled, in all three languages
+  - `render`: the document-listing embed (paginated, with a `showing x-y of n` footer) and the ingest
+    result
+  - Tests: every key exists in en/fr/ar, the listing keeps every document exactly once and stays under
+    the embed cap, an empty corpus is a notice rather than an empty embed
+  - _Requirements: 12.1, 12.3, 13.4, 14.3_
+
+- [ ] 16. URL ingest on the API (requirement 15) — the last blocking gap
+- [ ] 16.1 Add `ingest_url` to `DocumentBackend`, `RealDocumentBackend` and `FakeDocumentBackend`
+  - The adapter calls `ingest_pipeline.ingest_url` with the parsed expiry, exactly as the file path
+    calls `ingest_file`, so the SSRF guard, redirects, limits and marker ordering stay the pipeline's
+  - Tests: the adapter maps `created` / `replaced` / `updated` to `indexed`, passes `topic` and the
+    parsed `expires_at` through, and a bad date is a 422 before any fetch
+  - _Requirements: 15.2_
+
+- [ ] 16.2 Add `POST /api/v1/documents/url`
+  - Admin-only, form fields `url` / `visibility` / `topic` / `expires_at`, returning `{doc_id}`;
+    `_raise_for_failed_ingest` is reused so the codes and statuses match the file route
+  - Tests: `401` without the key, `200` with it, the same error mapping as the file route, and the
+    existing file route's tests unchanged
+  - Needs eequaled's sign-off: `main.py`'s `DocumentBackend` protocol and `api/documents.py` are
+    eequaled's files, so this lands as a PR they review
+  - _Requirements: 15.1, 15.3, 15.4_
+
+- [ ] 17. Documentation
+- [x] 17.1 Add the `DISCORD_*` variables to `.env.example`
+  - Done for the bot's own settings, including `DISCORD_GUILDS` with its grammar and the
+    blank-means-unset note; the drift test passes
+  - _Requirements: 8.1_
+- [ ] 17.2 Correct the README API table
+  - It claims `POST /api/v1/documents` takes "a file or URL"; name the file route and the URL route
+    separately once 16.2 exists
+  - _Requirements: 15.5_
+- [ ] 17.3 Record the new surfaces in the repo docs
+  - `AGENTS.md` "Discord bot" section: the six commands, the `DISCORD_GUILDS` grammar, the background
+    ingest and the expired-interaction fallback
+  - `EDGE_CASES.md`: the `{"doc_id"}`-only response (the bot cannot say indexed vs replaced vs
+    duplicate), the `NoDecode` discovery, and the background-task-vs-15-minute-token window
+  - `PROGRESS.md`: a dated entry for the admin surface
+  - _Requirements: 8.1, 10.2_
+
+- [ ] 18. Verification
+- [x] 18.1 Run `uv lock --check`, `ruff check .`, `ruff format --check .` and the fast pytests
+  - Green: 1337 passed, 249 skipped, 85 deselected; ruff check and format clean
+  - _Requirements: 9.3, 10.1, 10.2_
+- [ ] 18.2 Live guild check
+  - Six commands registered, `/documents` lists the corpus, an admin refused without the role, a real
+    file ingest through the API, and `/forget` deleting it again
+  - Blocked until the bot is deployed with a real `DISCORD_BOT_TOKEN`, `DISCORD_GUILDS` and
+    `ADMIN_API_KEY`
+  - _Requirements: 10.1, 10.2_

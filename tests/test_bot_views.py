@@ -1,20 +1,33 @@
-"""The feedback buttons (Req 5)."""
+"""The feedback buttons and the delete confirmation (Req 5, 14)."""
 
 import discord
 from structlog.testing import capture_logs
 
+from mcclub_rag.discordbot.client import AdminOutcome, ApiFailure
+from mcclub_rag.discordbot.notices import (
+    DELETE_CANCELLED,
+    DELETE_DONE,
+    DELETE_NOT_FOUND,
+    SERVICE_UNAVAILABLE,
+    notice,
+)
 from mcclub_rag.discordbot.views import (
+    CONFIRM_TIMEOUT_S,
     DOWN_LABEL,
     FEEDBACK_PREFIX,
     UP_LABEL,
+    DeleteView,
     FeedbackView,
     custom_id,
+    delete_custom_id,
     parse_custom_id,
+    parse_delete_custom_id,
     submit_rating,
 )
 from tests.bot_fakes import FakeInteraction, FakeRagClient
 
 CONVERSATION_ID = "c_1e4f2a"
+DOC_ID = "doc-1e4f2a"
 
 
 def _view(client: FakeRagClient | None = None) -> FeedbackView:
@@ -122,3 +135,81 @@ async def test_a_failed_recording_is_logged() -> None:
     failed = [entry for entry in entries if entry["event"] == "bot_feedback_failed"]
     assert len(failed) == 1
     assert failed[0]["rating"] == "up"
+
+
+# --- The delete confirmation (requirements 14.1, 14.2) -----------------------------------------
+
+
+def _delete_view(client: FakeRagClient | None = None) -> DeleteView:
+    return DeleteView(DOC_ID, client=client, language="en")
+
+
+def test_a_delete_press_cannot_delete_something_the_prompt_did_not_name() -> None:
+    view = _delete_view()
+    assert [item.custom_id for item in view.children] == [
+        delete_custom_id(DOC_ID),
+        delete_custom_id(DOC_ID),
+    ]
+    assert view.children[0].style is discord.ButtonStyle.danger
+    assert view.children[1].style is discord.ButtonStyle.secondary
+    assert parse_delete_custom_id("other:" + DOC_ID) is None
+    assert parse_delete_custom_id(delete_custom_id("")) is None
+
+
+def test_the_confirmation_expires() -> None:
+    """Req 14.2: a stale prompt must not delete something else later."""
+    assert _delete_view().timeout == CONFIRM_TIMEOUT_S == 120
+
+
+async def test_confirming_deletes_exactly_the_named_id() -> None:
+    client = FakeRagClient(admin=AdminOutcome(deleted=True))
+    view = _delete_view(client)
+    interaction = FakeInteraction()
+
+    await view.press(interaction, confirmed=True)
+
+    assert client.deletes == [DOC_ID]
+    assert interaction.events == ["defer", "edit_original_response"]
+    assert interaction.response.edits[0]["content"] == notice(DELETE_DONE, "en", doc_id=DOC_ID)
+    assert interaction.response.edits[0]["view"] is None
+    assert view.is_finished()
+
+
+async def test_cancelling_calls_nothing() -> None:
+    client = FakeRagClient()
+    view = _delete_view(client)
+    interaction = FakeInteraction()
+
+    await view.press(interaction, confirmed=False)
+
+    assert client.deletes == []
+    assert interaction.response.edits[0]["content"] == notice(DELETE_CANCELLED, "en")
+
+
+async def test_a_missing_document_is_reported_as_missing_after_the_press() -> None:
+    """Req 14.3: `{"ok": false}` is not success, even though a button was pressed."""
+    client = FakeRagClient(admin=AdminOutcome(deleted=False))
+    interaction = FakeInteraction()
+
+    await _delete_view(client).press(interaction, confirmed=True)
+
+    assert interaction.response.edits[0]["content"] == notice(DELETE_NOT_FOUND, "en", doc_id=DOC_ID)
+
+
+async def test_a_failed_delete_says_so() -> None:
+    client = FakeRagClient(admin=AdminOutcome(failure=ApiFailure("unreachable")))
+    interaction = FakeInteraction()
+
+    await _delete_view(client).press(interaction, confirmed=True)
+
+    assert interaction.response.edits[0]["content"] == notice(SERVICE_UNAVAILABLE, "en")
+
+
+async def test_a_delete_without_a_client_deletes_nothing_and_says_nothing() -> None:
+    interaction = FakeInteraction()
+
+    with capture_logs() as entries:
+        await _delete_view(None).press(interaction, confirmed=True)
+
+    assert interaction.response.edits == []
+    assert [entry["event"] for entry in entries] == ["bot_delete_without_client"]

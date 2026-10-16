@@ -22,7 +22,7 @@ async def run(settings: BotSettings) -> None:
 def main() -> None:
     settings = get_bot_settings()
     configure_logging(settings.log_level)
-    log.info("bot_starting", rag_base_url=settings.rag_base_url, guild_id=settings.guild_id)
+    log.info("bot_starting", rag_base_url=settings.rag_base_url, guilds=list(settings.guild_ids))
     asyncio.run(run(settings))
 
 

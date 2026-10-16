@@ -81,6 +81,70 @@ STATUS: dict[str, str] = {
 }
 
 
+ADMIN_ONLY: dict[str, str] = {
+    "en": "That command is for club admins only.",
+    "fr": "Cette commande est réservée aux admins du club.",
+    "ar": "هذا الأمر مخصص لمشرفي النادي فقط.",
+}
+ADMIN_REFUSED: dict[str, str] = {
+    "en": (
+        "The API refused the admin key. Check ADMIN_API_KEY on the app and on the bot, "
+        "then try again."
+    ),
+    "fr": (
+        "L'API a refusé la clé admin. Vérifiez ADMIN_API_KEY côté app et côté bot, puis réessayez."
+    ),
+    "ar": "رفضت الواجهة مفتاح المشرف. تحقق من ADMIN_API_KEY في التطبيق وفي البوت ثم أعد المحاولة.",
+}
+ONE_SOURCE: dict[str, str] = {
+    "en": "Give either a file or a url — not both, and not neither.",
+    "fr": "Donnez soit un fichier, soit une url — pas les deux, et pas aucun.",
+    "ar": "أعطني ملفا أو رابطا — لا كليهما ولا أي منهما.",
+}
+INGEST_STARTED: dict[str, str] = {
+    "en": "Ingesting {name} as {visibility}. This can take minutes; I will report here.",
+    "fr": "Ingestion de {name} en {visibility}. Cela peut prendre des minutes ; je répondrai ici.",
+    "ar": "جاري إدخال {name} بصلاحية {visibility}. قد يستغرق دقائق؛ سأخبرك هنا.",
+}
+# The API answers `{doc_id}` and nothing else, so the bot cannot say indexed vs replaced vs
+# duplicate here: it reports what it actually knows (EDGE_CASES.md).
+INGEST_DONE: dict[str, str] = {
+    "en": "{name} is in the corpus as {visibility}\n`{doc_id}`",
+    "fr": "{name} est dans le corpus en {visibility}\n`{doc_id}`",
+    "ar": "{name} أصبح في المجموعة بصلاحية {visibility}\n`{doc_id}`",
+}
+INGEST_FAILED: dict[str, str] = {
+    "en": "Could not ingest {name}: {reason}",
+    "fr": "Impossible d'ingérer {name} : {reason}",
+    "ar": "تعذر إدخال {name}: {reason}",
+}
+NO_DOCUMENTS: dict[str, str] = {
+    "en": "The corpus is empty: nothing has been ingested yet.",
+    "fr": "Le corpus est vide : rien n'a encore été ingéré.",
+    "ar": "المجموعة فارغة: لم يتم إدخال أي وثيقة بعد.",
+}
+DELETE_CONFIRM: dict[str, str] = {
+    "en": "Delete {name} from the corpus? This cannot be undone.\n`{doc_id}`",
+    "fr": "Supprimer {name} du corpus ? C'est irréversible.\n`{doc_id}`",
+    "ar": "حذف {name} من المجموعة؟ لا يمكن التراجع.\n`{doc_id}`",
+}
+DELETE_DONE: dict[str, str] = {
+    "en": "Removed from the corpus\n`{doc_id}`",
+    "fr": "Supprimé du corpus\n`{doc_id}`",
+    "ar": "تم الحذف من المجموعة\n`{doc_id}`",
+}
+DELETE_NOT_FOUND: dict[str, str] = {
+    "en": "No document with that id — nothing was deleted.\n`{doc_id}`",
+    "fr": "Aucun document avec cet identifiant — rien n'a été supprimé.\n`{doc_id}`",
+    "ar": "لا توجد وثيقة بهذا المعرف — لم يتم حذف أي شيء.\n`{doc_id}`",
+}
+DELETE_CANCELLED: dict[str, str] = {
+    "en": "Nothing was deleted.",
+    "fr": "Rien n'a été supprimé.",
+    "ar": "لم يتم حذف أي شيء.",
+}
+
+
 def notice_language(text: str) -> NoticeLanguage:
     """The language a notice about ``text`` is written in; English when it cannot be told."""
     language = detect_language(text)

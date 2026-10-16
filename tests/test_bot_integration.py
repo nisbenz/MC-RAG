@@ -23,8 +23,7 @@ def _settings() -> BotSettings:
     return BotSettings(
         _env_file=None,
         bot_token="test-token",
-        guild_id=42,
-        member_role_id=7,
+        guilds="42:7",
         member_token=MEMBER_TOKEN,
         user_cooldown_s=20.0,
         max_concurrency=4,
